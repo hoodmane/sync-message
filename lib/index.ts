@@ -26,6 +26,56 @@ export function isServiceWorkerRequest(request: FetchEvent | string): boolean {
   return request.includes(BASE_URL_SUFFIX);
 }
 
+async function serviceWorkerFetchRespond(
+  earlyMessages: {[messageId: string]: any},
+  resolvers: {[messageId: string]: (r: Response) => void},
+  url: string,
+  e: FetchEvent,
+): Promise<Response> {
+  function success(message: any) {
+    const response: ServiceWorkerResponse = {message, version: VERSION};
+    return new Response(JSON.stringify(response), {status: 200});
+  }
+
+  if (url.endsWith("/read")) {
+    const {
+      messageId,
+      timeout,
+    }: ServiceWorkerReadRequest = await e.request.json();
+    const data = earlyMessages[messageId];
+    if (data) {
+      delete earlyMessages[messageId];
+      return success(data);
+    } else {
+      return await new Promise((resolver) => {
+        resolvers[messageId] = resolver;
+
+        function callback() {
+          delete resolvers[messageId];
+          resolver(new Response("", {status: 408})); // timeout
+        }
+
+        setTimeout(callback, timeout);
+      });
+    }
+  } else if (url.endsWith("/write")) {
+    const {
+      message,
+      messageId,
+    }: ServiceWorkerWriteRequest = await e.request.json();
+    const resolver = resolvers[messageId];
+    if (resolver) {
+      resolver(success(message));
+      delete resolvers[messageId];
+    } else {
+      earlyMessages[messageId] = message;
+    }
+    return success({early: !resolver});
+  } else if (url.endsWith("/version")) {
+    return new Response(VERSION, {status: 200});
+  }
+}
+
 /**
  * Returns a function that can respond to fetch events in a service worker event listener.
  * The function returns true if the request came from this library and it responded.
@@ -41,52 +91,7 @@ export function serviceWorkerFetchListener(): (e: FetchEvent) => boolean {
       return false;
     }
 
-    async function respond(): Promise<Response> {
-      function success(message: any) {
-        const response: ServiceWorkerResponse = {message, version: VERSION};
-        return new Response(JSON.stringify(response), {status: 200});
-      }
-
-      if (url.endsWith("/read")) {
-        const {
-          messageId,
-          timeout,
-        }: ServiceWorkerReadRequest = await e.request.json();
-        const data = earlyMessages[messageId];
-        if (data) {
-          delete earlyMessages[messageId];
-          return success(data);
-        } else {
-          return await new Promise((resolver) => {
-            resolvers[messageId] = resolver;
-
-            function callback() {
-              delete resolvers[messageId];
-              resolver(new Response("", {status: 408})); // timeout
-            }
-
-            setTimeout(callback, timeout);
-          });
-        }
-      } else if (url.endsWith("/write")) {
-        const {
-          message,
-          messageId,
-        }: ServiceWorkerWriteRequest = await e.request.json();
-        const resolver = resolvers[messageId];
-        if (resolver) {
-          resolver(success(message));
-          delete resolvers[messageId];
-        } else {
-          earlyMessages[messageId] = message;
-        }
-        return success({early: !resolver});
-      } else if (url.endsWith("/version")) {
-        return new Response(VERSION, {status: 200});
-      }
-    }
-
-    e.respondWith(respond());
+    e.respondWith(serviceWorkerFetchRespond(earlyMessages, resolvers, url, e));
     return true;
   };
 }
